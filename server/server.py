@@ -1,81 +1,147 @@
-import pickle
+# server/server.py
+
 import sys
-import json
-from pathlib import Path
+from flask import Flask, request, jsonify
 from phe import paillier
 
-def load_keys():
-    base = Path(__file__).parent.parent / "keys"
-    pub_path  = base / "pubkey.pkl"
-    priv_path = base / "privkey.pkl"
+app = Flask(__name__)
 
-    if not pub_path.exists():
-        print(f"❌ Error: public key not found at {pub_path}")
-        sys.exit(1)
-    if not priv_path.exists():
-        print(f"❌ Error: private key not found at {priv_path}")
-        sys.exit(1)
-
-    with open(pub_path,  "rb") as f: pubkey  = pickle.load(f)
-    with open(priv_path, "rb") as f: privkey = pickle.load(f)
-    return pubkey, privkey
-
-def load_encrypted_votes(pubkey):
-    votes_dir = Path(__file__).parent.parent / "votes"
-    if not votes_dir.exists():
-        print(f"❌ Error: votes directory not found at {votes_dir}")
-        sys.exit(1)
-
-    files = list(votes_dir.glob("*.json"))
-    if not files:
-        print(f"❌ No vote files found in {votes_dir}")
-        sys.exit(1)
-
-    encrypted_votes = []
-    for file in sorted(files):
-        try:
-            with open(file, "r") as f:
-                data = json.load(f)
-            ciphertext = int(data["ciphertext"])
-            exponent   = data["exponent"]
-            enc_vote = paillier.EncryptedNumber(pubkey, ciphertext, exponent)
-            encrypted_votes.append(enc_vote)
-        except Exception as e:
-            print(f"❌ Error parsing {file.name}: {e}")
-            sys.exit(1)
-
-    print(f"✅ Loaded {len(encrypted_votes)} encrypted vote(s).")
-    return encrypted_votes
+#
+# ────────────────────────────────────────────────────────────────────────────
+# Global variables on the server
+# ────────────────────────────────────────────────────────────────────────────
+server_pubkey = None  # Will hold the PaillierPublicKey once set
+server_encrypted_sum = None  # Will hold the homomorphic running sum
+received_commitments = []  # Simply store all commitments for potential later verification
 
 
-def tally_votes(encrypted_votes):
-    # 3.3 Homomorphic sum: start from the first vote, then add the rest
-    total_enc = encrypted_votes[0]
-    for enc in encrypted_votes[1:]:
-        total_enc += enc
-    print("✅ Homomorphic tally complete.")
-    return total_enc
+#
+# ────────────────────────────────────────────────────────────────────────────
+# Endpoint #1: POST /set_public_key
+#   Client sends JSON { "n": "...", "g": "..." }
+#   We reconstruct a PaillierPublicKey(n, g) and initialize encrypted_sum = encrypt(0).
+# ────────────────────────────────────────────────────────────────────────────
+@app.route("/set_public_key", methods=["POST"])
+def set_public_key():
+    global server_pubkey, server_encrypted_sum
 
-def decrypt_and_display(total_enc, privkey, num_votes):
-    # 3.4 Decrypt the homomorphic sum
-    total_yes = privkey.decrypt(total_enc)
-    total_no  = num_votes - total_yes
+    data = request.get_json()
+    # If no JSON or missing "n", return 400:
+    if data is None or "n" not in data:
+        return jsonify({"error": "Invalid JSON payload; expected 'n'"}), 400
 
-    print("✅ Decryption complete.")
-    print("Poll results:")
-    print(f"  Yes votes: {total_yes}")
-    print(f"  No  votes: {total_no}")
+    try:
+        n = int(data["n"])
+    except ValueError:
+        return jsonify({"error": "'n' must be an integer string"}), 400
+
+    # Reconstruct the public key using only n (phe uses g = n + 1 by default):
+    server_pubkey = paillier.PaillierPublicKey(n)
+    # Initialize running sum as Enc(0) under that public key:
+    server_encrypted_sum = server_pubkey.encrypt(0)
+
+    print(f"✅ /set_public_key: Received public key n={n}.")
+    print("    Initialized running encrypted sum = Enc(0).")
+
+    return jsonify({"status": "public key stored"}), 200
 
 
+
+#
+# ────────────────────────────────────────────────────────────────────────────
+# Endpoint #2: POST /submit_vote
+#   Client sends JSON { "voter_id": "...", "ciphertext": "...", "exponent": 123 }
+#   We reconstruct an EncryptedNumber and homomorphically add it to server_encrypted_sum.
+# ────────────────────────────────────────────────────────────────────────────
+@app.route("/submit_vote", methods=["POST"])
+def submit_vote():
+    global server_pubkey, server_encrypted_sum
+
+    if server_pubkey is None or server_encrypted_sum is None:
+        return jsonify({"error": "Public key has not been set yet"}), 400
+
+    data = request.get_json()
+    if data is None or "voter_id" not in data or "ciphertext" not in data or "exponent" not in data:
+        return jsonify({"error": "Invalid JSON payload; expected 'voter_id', 'ciphertext', and 'exponent'"}), 400
+
+    try:
+        voter_id = data["voter_id"]
+        ciphertext = int(data["ciphertext"])
+        exponent = int(data["exponent"])
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid ciphertext/exponent; must be integer strings"}), 400
+
+    # Reconstruct an EncryptedNumber under the stored public key
+    try:
+        incoming_cipher = paillier.EncryptedNumber(server_pubkey, ciphertext, exponent)
+    except Exception as e:
+        return jsonify({"error": f"Failed to reconstruct EncryptedNumber: {e}"}), 400
+
+    # Homomorphically add to the running sum
+    server_encrypted_sum = server_encrypted_sum + incoming_cipher
+
+    print(f"✅ /submit_vote: Received vote from '{voter_id}'. Added to running sum.")
+    return jsonify({"status": "vote recorded"}), 200
+
+
+#
+# ────────────────────────────────────────────────────────────────────────────
+# Endpoint #3: POST /submit_commitment
+#   Client sends JSON { "voter_id": "...", "commitment": "...", "salt": "..." }
+#   We simply store it in memory for potential Phase 2 verification.
+# ────────────────────────────────────────────────────────────────────────────
+@app.route("/submit_commitment", methods=["POST"])
+def submit_commitment():
+    global received_commitments
+
+    data = request.get_json()
+    if data is None or "voter_id" not in data or "commitment" not in data or "salt" not in data:
+        return jsonify({"error": "Invalid JSON payload; expected 'voter_id', 'commitment', and 'salt'"}), 400
+
+    voter_id = data["voter_id"]
+    commitment = data["commitment"]
+    salt = data["salt"]
+
+    # Store each commitment tuple in memory
+    received_commitments.append({
+        "voter_id": voter_id,
+        "commitment": commitment,
+        "salt": salt
+    })
+
+    print(f"✅ /submit_commitment: Stored commitment for voter '{voter_id}'.")
+    return jsonify({"status": "commitment recorded"}), 200
+
+
+#
+# ────────────────────────────────────────────────────────────────────────────
+# Endpoint #4: GET /get_encrypted_tally
+#   Returns JSON { "ciphertext": "...", "exponent": 789 } for server_encrypted_sum
+# ────────────────────────────────────────────────────────────────────────────
+@app.route("/get_encrypted_tally", methods=["GET"])
+def get_encrypted_tally():
+    global server_pubkey, server_encrypted_sum
+
+    if server_pubkey is None or server_encrypted_sum is None:
+        return jsonify({"error": "No votes recorded or public key not set"}), 400
+
+    # Send back the single Ciphertext and exponent
+    response = {
+        "ciphertext": str(server_encrypted_sum.ciphertext()),
+        "exponent": server_encrypted_sum.exponent
+    }
+
+    print("✅ /get_encrypted_tally: Returning the current encrypted sum to client.")
+    return jsonify(response), 200
+
+
+#
+# ────────────────────────────────────────────────────────────────────────────
+# Main entry‐point: start the Flask server
+# ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # 3.1 Load keys
-    pubkey, privkey = load_keys()
-    print("✅ Public & private keys loaded successfully.")
-
-    # 3.2 Discover & parse encrypted votes
-    encrypted_votes = load_encrypted_votes(pubkey)
-    total_encrypted_vote = tally_votes(encrypted_votes)
-    decrypt_and_display(total_encrypted_vote, privkey, len(encrypted_votes))
-
+    # You can change host="0.0.0.0" or port=5000 if needed
+    print("🚀 Starting server on http://localhost:5000 …")
+    app.run(host="0.0.0.0", port=5000)
 
 
